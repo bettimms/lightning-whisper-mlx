@@ -73,6 +73,7 @@ class MultiHeadAttention(nn.Module):
     def qkv_attention(self, q, k, v, mask=None):
         """Use Metal-optimized fused SDPA kernel (1.3-1.7x faster than manual matmul+softmax)."""
         n_batch, n_ctx, n_state = q.shape
+        k_ctx = k.shape[1]
         d_head = n_state // self.n_head
         scale = d_head ** -0.5
         q = q.reshape(*q.shape[:2], self.n_head, -1).transpose(0, 2, 1, 3)
@@ -80,7 +81,7 @@ class MultiHeadAttention(nn.Module):
         v = v.reshape(*v.shape[:2], self.n_head, -1).transpose(0, 2, 1, 3)
         if mask is not None:
             out = mx.fast.scaled_dot_product_attention(
-                q, k, v, scale=scale, mask=mask[:n_ctx, :n_ctx],
+                q, k, v, scale=scale, mask=mask[:n_ctx, :k_ctx],
             )
         else:
             out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale)
@@ -214,7 +215,7 @@ class TextDecoder(nn.Module):
             + mx.take(self.positional_embedding, positions, axis=0)
         )
         x, kv_cache, _ = self._decode_blocks(
-            x, xa, kv_cache=kv_cache, mask=None, return_cross_qk=False
+            x, xa, kv_cache=kv_cache, mask=self._mask, return_cross_qk=False
         )
         x = self.ln(x)
         return x @ self.token_embedding.weight.T, kv_cache
