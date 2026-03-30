@@ -163,7 +163,8 @@ class Inference:
         # a 9-item batch leaves source_indices == [0..7]. Always apply the row
         # selection whenever a cache exists so cache batch size stays aligned.
         if self.kv_cache is not None:
-            self.kv_cache = tree_map(lambda x: x[source_indices], self.kv_cache)
+            idx = mx.array(source_indices, dtype=mx.int32)
+            self.kv_cache = tree_map(lambda x: x[idx], self.kv_cache)
 
     def reset(self):
         self.kv_cache = None
