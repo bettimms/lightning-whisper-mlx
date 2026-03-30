@@ -158,8 +158,11 @@ class Inference:
 
     def rearrange_kv_cache(self, source_indices):
         """Update the key-value cache according to the updated beams"""
-        # update the key/value cache to contain the selected sequences
-        if source_indices != list(range(len(source_indices))):
+        # After batch compaction the new active rows may still be [0..N-1] while
+        # the cached tensors remain larger, e.g. dropping only the last row from
+        # a 9-item batch leaves source_indices == [0..7]. Always apply the row
+        # selection whenever a cache exists so cache batch size stays aligned.
+        if self.kv_cache is not None:
             self.kv_cache = tree_map(lambda x: x[source_indices], self.kv_cache)
 
     def reset(self):

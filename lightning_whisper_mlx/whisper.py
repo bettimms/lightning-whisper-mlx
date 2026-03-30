@@ -210,12 +210,13 @@ class TextDecoder(nn.Module):
     def _decode_step(self, tokens, xa, kv_cache):
         offset = kv_cache[0][0][0].shape[1]
         positions = mx.array([offset])
+        step_mask = self._mask[offset : offset + tokens.shape[-1], : offset + tokens.shape[-1]]
         x = (
             self.token_embedding(tokens)
             + mx.take(self.positional_embedding, positions, axis=0)
         )
         x, kv_cache, _ = self._decode_blocks(
-            x, xa, kv_cache=kv_cache, mask=self._mask, return_cross_qk=False
+            x, xa, kv_cache=kv_cache, mask=step_mask, return_cross_qk=False
         )
         x = self.ln(x)
         return x @ self.token_embedding.weight.T, kv_cache
