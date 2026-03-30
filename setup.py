@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='lightning-whisper-mlx',
-    version='0.0.10',
+    version='0.1.0',
     packages=find_packages(),
     package_data={
         'lightning_whisper_mlx': ['assets/*']
@@ -12,10 +12,13 @@ setup(
         "mlx",
         "numba",
         "numpy",
-        "torch",
         "tqdm",
         "more-itertools",
         "tiktoken==0.3.3",
-        "scipy"
+        "scipy",
     ],
+    extras_require={
+        "fast-audio": ["soundfile", "librosa"],
+    },
+    python_requires=">=3.10",
 )

@@ -127,6 +127,7 @@ class DecodingResult:
     no_speech_prob: float = np.nan
     temperature: float = np.nan
     compression_ratio: float = np.nan
+    token_probs: Optional[np.ndarray] = None
 
 
 class Inference:
@@ -256,6 +257,10 @@ class GreedyDecoder(TokenDecoder):
     def __init__(self, temperature: float, eot: int):
         self.temperature = temperature
         self.eot = eot
+        self._step_probs = []
+
+    def reset(self):
+        self._step_probs = []
 
     def update(
         self, tokens: mx.array, logits: mx.array, sum_logprobs: mx.array
@@ -265,11 +270,11 @@ class GreedyDecoder(TokenDecoder):
         else:
             next_tokens = mx.random.categorical(logits=logits / self.temperature)
 
-        next_tokens = mx.argmax(logits, axis=-1)
         logits = logits.astype(mx.float32)
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
 
         current_logprobs = logprobs[mx.arange(logprobs.shape[0]), next_tokens]
+        self._step_probs.append(mx.exp(current_logprobs))
         sum_logprobs += current_logprobs * (tokens[:, -1] != self.eot)
 
         eot_mask = tokens[:, -1] == self.eot
@@ -336,59 +341,76 @@ class ApplyTimestampRules(LogitFilter):
         self.max_initial_timestamp_index = max_initial_timestamp_index
 
     def apply(self, logits: mx.array, tokens: mx.array) -> mx.array:
-        mask = np.zeros(logits.shape, np.float32)
-        # suppress <|notimestamps|> which is handled by without_timestamps
+        """Vectorized timestamp rule application.
+
+        Replaces per-batch-item Python loops with batched numpy/mlx operations,
+        eliminating repeated GPU->CPU syncs during autoregressive decoding.
+        """
+        n_batch = tokens.shape[0]
+        n_vocab = logits.shape[-1]
+        ts_begin = self.tokenizer.timestamp_begin
+        eot = self.tokenizer.eot
+
+        mask = np.zeros((n_batch, n_vocab), np.float32)
+
+        # Suppress <|notimestamps|>
         if self.tokenizer.no_timestamps is not None:
             mask[:, self.tokenizer.no_timestamps] = -np.inf
 
-        # timestamps have to appear in pairs, except directly before EOT; mask logits accordingly
-        for k in range(tokens.shape[0]):
-            sampled_tokens = tokens[k, self.sample_begin :]
-            seq = sampled_tokens.tolist()
-            last_was_timestamp = (
-                len(seq) >= 1 and seq[-1] >= self.tokenizer.timestamp_begin
-            )
-            penultimate_was_timestamp = (
-                len(seq) < 2 or seq[-2] >= self.tokenizer.timestamp_begin
-            )
+        # Single numpy conversion for the entire batch — one GPU sync instead of N
+        sampled = tokens[:, self.sample_begin:]
+        sampled_np = np.array(sampled)
+        seq_len = sampled_np.shape[1]
 
-            if last_was_timestamp:
-                if penultimate_was_timestamp:  # has to be non-timestamp
-                    mask[k, self.tokenizer.timestamp_begin :] = -np.inf
-                else:  # cannot be normal text tokens
-                    mask[k, : self.tokenizer.eot] = -np.inf
+        if seq_len >= 1:
+            last_tok = sampled_np[:, -1]
+            last_is_ts = last_tok >= ts_begin
 
-            timestamps = [
-                i for i, v in enumerate(seq) if v > self.tokenizer.timestamp_begin
-            ]
-            if len(timestamps) > 0:
-                # timestamps shouldn't decrease; forbid timestamp tokens smaller than the last
-                # also force each segment to have a nonzero length, to prevent infinite looping
-                last_timestamp = timestamps[-1]
-                if not last_timestamp or penultimate_was_timestamp:
-                    last_timestamp += 1
-                mask[k, self.tokenizer.timestamp_begin : last_timestamp] = -np.inf
+            penult_is_ts = np.ones(n_batch, dtype=bool)
+            if seq_len >= 2:
+                penult_is_ts = sampled_np[:, -2] >= ts_begin
 
+            # Where last was timestamp AND penultimate was timestamp -> suppress all timestamps
+            both_ts = last_is_ts & penult_is_ts
+            for k in np.where(both_ts)[0]:
+                mask[k, ts_begin:] = -np.inf
+
+            # Where last was timestamp AND penultimate was NOT timestamp -> suppress text tokens
+            ts_after_text = last_is_ts & ~penult_is_ts
+            for k in np.where(ts_after_text)[0]:
+                mask[k, :eot] = -np.inf
+
+            # Monotonicity constraint on timestamps
+            ts_mask = sampled_np >= ts_begin
+            ts_indices = np.where(ts_mask, np.arange(seq_len)[None, :], -1)
+            has_any_ts = ts_mask.any(axis=1)
+
+            if has_any_ts.any():
+                last_ts_pos = ts_indices.max(axis=1)
+                for k in np.where(has_any_ts)[0]:
+                    pos = last_ts_pos[k]
+                    last_timestamp = pos
+                    if not last_timestamp or penult_is_ts[k]:
+                        last_timestamp += 1
+                    if last_timestamp > 0:
+                        mask[k, ts_begin:ts_begin + last_timestamp] = -np.inf
+
+        # First-step rules
         if tokens.shape[1] == self.sample_begin:
-            # suppress generating non-timestamp tokens at the beginning
-            mask[:, : self.tokenizer.timestamp_begin] = -np.inf
-
-            # apply the `max_initial_timestamp` option
+            mask[:, :ts_begin] = -np.inf
             if self.max_initial_timestamp_index is not None:
-                last_allowed = (
-                    self.tokenizer.timestamp_begin + self.max_initial_timestamp_index
-                )
-                mask[:, last_allowed + 1 :] = -np.inf
+                last_allowed = ts_begin + self.max_initial_timestamp_index
+                mask[:, last_allowed + 1:] = -np.inf
 
-        # if sum of probability over timestamps is above any other token, sample timestamp
+        # Vectorized: if timestamp probability > max text probability, force timestamp
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        for k in range(tokens.shape[0]):
-            timestamp_logprob = logprobs[k, self.tokenizer.timestamp_begin :].logsumexp(
-                axis=-1
-            )
-            max_text_token_logprob = logprobs[k, : self.tokenizer.timestamp_begin].max()
-            if timestamp_logprob > max_text_token_logprob:
-                mask[k, : self.tokenizer.timestamp_begin] = -np.inf
+        ts_logprobs = mx.logsumexp(logprobs[:, ts_begin:], axis=-1)
+        max_text_logprobs = mx.max(logprobs[:, :ts_begin], axis=-1)
+        force_ts = np.array(ts_logprobs > max_text_logprobs)
+
+        if force_ts.any():
+            for k in np.where(force_ts)[0]:
+                mask[k, :ts_begin] = -np.inf
 
         return logits + mx.array(mask, logits.dtype)
 
@@ -677,21 +699,37 @@ class DecodingTask:
         if len(set(map(len, fields))) != 1:
             raise RuntimeError(f"inconsistent result lengths: {list(map(len, fields))}")
 
-        return [
-            DecodingResult(
-                audio_features=features,
-                language=language,
-                tokens=tokens,
-                text=text,
-                avg_logprob=avg_logprob,
-                no_speech_prob=no_speech_prob,
-                temperature=self.options.temperature,
-                compression_ratio=compression_ratio(text),
+        # Extract per-token probabilities captured by GreedyDecoder
+        step_probs = getattr(self.decoder, '_step_probs', [])
+        if step_probs:
+            stacked = mx.stack(step_probs, axis=0)  # (n_steps, n_batch)
+            stacked_np = np.array(stacked)
+        else:
+            stacked_np = None
+
+        results = []
+        for k, (text, language, toks, features, avg_logprob, no_speech_prob) in enumerate(
+            zip(*fields)
+        ):
+            if stacked_np is not None:
+                n_tok = len(toks)
+                probs = stacked_np[:n_tok, k] if n_tok > 0 and k < stacked_np.shape[1] else None
+            else:
+                probs = None
+            results.append(
+                DecodingResult(
+                    audio_features=features,
+                    language=language,
+                    tokens=toks,
+                    text=text,
+                    avg_logprob=avg_logprob,
+                    no_speech_prob=no_speech_prob,
+                    temperature=self.options.temperature,
+                    compression_ratio=compression_ratio(text),
+                    token_probs=probs,
+                )
             )
-            for text, language, tokens, features, avg_logprob, no_speech_prob in zip(
-                *fields
-            )
-        ]
+        return results
 
 
 def decode(
