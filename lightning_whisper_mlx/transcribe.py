@@ -417,7 +417,7 @@ def transcribe_audio(
         if not len(mel_segments):
             break
 
-        mel_segment_batch = mx.array(mx.stack(mel_segments, axis=0))
+        mel_segment_batch = mx.stack(mel_segments, axis=0)
         decode_options["prompt"] = all_tokens[prompt_reset_since:]
         result: DecodingResult = decode_with_fallback(mel_segment_batch)
 

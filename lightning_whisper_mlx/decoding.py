@@ -267,9 +267,11 @@ class GreedyDecoder(TokenDecoder):
         self.temperature = temperature
         self.eot = eot
         self._step_probs = []
+        self._batch_indices = None
 
     def reset(self):
         self._step_probs = []
+        self._batch_indices = None
 
     def update(
         self, tokens: mx.array, logits: mx.array, sum_logprobs: mx.array
@@ -279,10 +281,15 @@ class GreedyDecoder(TokenDecoder):
         else:
             next_tokens = mx.random.categorical(logits=logits / self.temperature)
 
-        logits = logits.astype(mx.float32)
+        # logits already float32 from Inference.logits() — skip redundant cast
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
 
-        current_logprobs = logprobs[mx.arange(logprobs.shape[0]), next_tokens]
+        # Cache batch indices to avoid per-step mx.arange allocation
+        n = logprobs.shape[0]
+        if self._batch_indices is None or self._batch_indices.shape[0] != n:
+            self._batch_indices = mx.arange(n)
+
+        current_logprobs = logprobs[self._batch_indices, next_tokens]
         self._step_probs.append(mx.exp(current_logprobs))
         sum_logprobs += current_logprobs * (tokens[:, -1] != self.eot)
 
@@ -354,6 +361,8 @@ class ApplyTimestampRules(LogitFilter):
         self._no_timestamps = tokenizer.no_timestamps
         # Pre-allocate mask buffer (resized on first call)
         self._mask_buf = None
+        # Lazy-initialized mask for GPU-only force-timestamp (see apply_cpu)
+        self._text_positions = None
 
     def _get_mask_buf(self, n_batch: int, n_vocab: int) -> np.ndarray:
         """Reuse a pre-allocated buffer instead of np.zeros() every step."""
@@ -422,6 +431,76 @@ class ApplyTimestampRules(LogitFilter):
             mask[0, :ts_begin] = -np.inf
 
         return logits + mx.array(mask, logits.dtype)
+
+    def apply_cpu(self, logits: mx.array, cpu_sampled: list) -> mx.array:
+        """Optimized single-batch path using CPU token list.
+
+        Avoids GPU→CPU transfer for token sequence and eliminates the GPU sync
+        in the force-timestamp check by computing it entirely on GPU.
+
+        Parameters
+        ----------
+        logits : mx.array, shape = (1, vocab_size)
+        cpu_sampled : list of int — decoded tokens after sample_begin (CPU-side)
+        """
+        ts_begin = self._ts_begin
+        eot = self._eot
+        n_vocab = logits.shape[-1]
+
+        mask = self._get_mask_buf(1, n_vocab)
+
+        if self._no_timestamps is not None:
+            mask[0, self._no_timestamps] = -np.inf
+
+        seq_len = len(cpu_sampled)
+
+        if seq_len >= 1:
+            last = cpu_sampled[-1]
+            last_is_ts = last >= ts_begin
+            penult_is_ts = True if seq_len < 2 else cpu_sampled[-2] >= ts_begin
+
+            if last_is_ts:
+                if penult_is_ts:
+                    mask[0, ts_begin:] = -np.inf
+                else:
+                    mask[0, :eot] = -np.inf
+
+            # Enforce monotonically increasing timestamps
+            ts_positions = [i for i, t in enumerate(cpu_sampled) if t >= ts_begin]
+            if ts_positions:
+                last_timestamp = ts_positions[-1]
+                if not last_timestamp or penult_is_ts:
+                    last_timestamp += 1
+                if last_timestamp > 0:
+                    mask[0, ts_begin:ts_begin + last_timestamp] = -np.inf
+
+        if seq_len == 0:
+            # First sample step — constrain to timestamps only
+            mask[0, :ts_begin] = -np.inf
+            if self.max_initial_timestamp_index is not None:
+                last_allowed = ts_begin + self.max_initial_timestamp_index
+                mask[0, last_allowed + 1:] = -np.inf
+
+        mask_mx = mx.array(mask, logits.dtype)
+
+        # Force-timestamp: if P(timestamp) > max P(text_token), suppress all text.
+        # Computed entirely on GPU — no .item() sync.
+        if seq_len > 0:
+            # Lazy-init boolean mask for text token positions
+            if self._text_positions is None or self._text_positions.shape[0] != n_vocab:
+                tp = np.zeros(n_vocab, dtype=np.float32)
+                tp[:ts_begin] = 1.0
+                self._text_positions = mx.array(tp, logits.dtype)
+
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            ts_logprob = mx.logsumexp(logprobs[0, ts_begin:], axis=-1)
+            max_text_logprob = mx.max(logprobs[0, :ts_begin], axis=-1)
+            should_force = ts_logprob > max_text_logprob
+            # -1e9 instead of -inf to avoid NaN from -inf * 0
+            force_val = mx.where(should_force, mx.array(-1e9, logits.dtype), mx.array(0.0, logits.dtype))
+            return logits + mask_mx + force_val * self._text_positions
+
+        return logits + mask_mx
 
     def _apply_batch(self, logits: mx.array, tokens: mx.array, n_batch: int) -> mx.array:
         """Vectorized path for multi-item batches."""
@@ -671,7 +750,7 @@ class DecodingTask:
     def _main_loop(self, audio_features: mx.array, tokens: mx.array):
         n_batch = tokens.shape[0]
         sum_logprobs: mx.array = mx.zeros(n_batch)
-        no_speech_probs = [np.nan] * n_batch
+        no_speech_probs_mx = None  # deferred — avoid GPU sync on step 0
 
         # Local references to avoid attribute lookups in the hot loop
         inference_logits = self.inference.logits
@@ -684,16 +763,22 @@ class DecodingTask:
         n_ctx = self.n_ctx
         sot_index = self.sot_index
         no_speech_token = self.tokenizer.no_speech
+        eot_id = self.tokenizer.eot
+
+        # Batch-size-1 fast path: track tokens on CPU, skip lazy `completed` eval
+        is_single = n_batch == 1
+        # CPU mirror of sampled tokens — avoids GPU→CPU transfer in timestamp rules
+        cpu_sampled = [] if (is_single and ts_filter is not None) else None
 
         try:
             for i in range(sample_len):
                 logits = inference_logits(tokens, audio_features)
 
                 if i == 0 and no_speech_token is not None:
-                    probs_at_sot = mx.softmax(
+                    # Store mx.array — defer .tolist() until after loop
+                    no_speech_probs_mx = mx.softmax(
                         logits[:, sot_index].astype(mx.float32), axis=-1
-                    )
-                    no_speech_probs = probs_at_sot[:, no_speech_token].tolist()
+                    )[:, no_speech_token]
 
                 logits = logits[:, -1]
 
@@ -706,16 +791,34 @@ class DecodingTask:
 
                 # Timestamp rules (the only stateful per-step filter)
                 if ts_filter is not None:
-                    logits = ts_filter.apply(logits, tokens)
+                    if cpu_sampled is not None:
+                        # CPU path: no GPU→CPU transfer, no .item() sync for force-ts
+                        logits = ts_filter.apply_cpu(logits, cpu_sampled)
+                    else:
+                        logits = ts_filter.apply(logits, tokens)
 
                 tokens, completed, sum_logprobs = decoder_update(
                     tokens, logits, sum_logprobs
                 )
 
-                if completed or tokens.shape[-1] > n_ctx:
-                    break
+                if is_single:
+                    # Single sync: get last token for CPU tracking + EOT check
+                    last_tok = tokens[0, -1].item()
+                    if cpu_sampled is not None:
+                        cpu_sampled.append(last_tok)
+                    if last_tok == eot_id or tokens.shape[-1] > n_ctx:
+                        break
+                else:
+                    if completed or tokens.shape[-1] > n_ctx:
+                        break
         finally:
             self.inference.reset()
+
+        # Deferred no_speech_probs sync (was previously on step 0)
+        if no_speech_probs_mx is not None:
+            no_speech_probs = no_speech_probs_mx.tolist()
+        else:
+            no_speech_probs = [np.nan] * n_batch
 
         return tokens, sum_logprobs, no_speech_probs
 
