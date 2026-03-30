@@ -183,27 +183,13 @@ class TextDecoder(nn.Module):
         self._mask = nn.MultiHeadAttention.create_additive_causal_mask(n_ctx).astype(
             dtype
         )
+        self._compiled_decode_step = None
+        self._compile_step_failed = False
 
-    def __call__(self, x, xa, kv_cache=None, return_cross_qk=False):
-        """
-        x : mx.array, shape = (batch_size, <= n_ctx)
-            the text tokens
-        xa : mx.array, shape = (batch_size, n_audio_ctx, n_audio_state)
-            the encoded audio features to be attended on
-        return_cross_qk : bool
-            If False (default), skip cross_qk collection for faster decode.
-            Only needed for word-level timestamp alignment (DTW).
-        """
-        offset = kv_cache[0][0][0].shape[1] if kv_cache else 0
-        x = (
-            self.token_embedding(x)
-            + self.positional_embedding[offset : offset + x.shape[-1]]
-        )
-
+    def _decode_blocks(self, x, xa, kv_cache, mask, return_cross_qk):
         n = self._n_blocks
         if kv_cache is None:
             kv_cache = [None] * n
-        mask = self._mask
 
         if return_cross_qk:
             cross_qk = [None] * n
@@ -218,6 +204,67 @@ class TextDecoder(nn.Module):
                 )
             cross_qk = None
 
+        return x, kv_cache, cross_qk
+
+    def _decode_step(self, tokens, xa, kv_cache):
+        offset = kv_cache[0][0][0].shape[1]
+        positions = mx.array([offset])
+        x = (
+            self.token_embedding(tokens)
+            + mx.take(self.positional_embedding, positions, axis=0)
+        )
+        x, kv_cache, _ = self._decode_blocks(
+            x, xa, kv_cache=kv_cache, mask=None, return_cross_qk=False
+        )
+        x = self.ln(x)
+        return x @ self.token_embedding.weight.T, kv_cache
+
+    def _get_compiled_decode_step(self):
+        if self._compiled_decode_step is None and not self._compile_step_failed:
+            try:
+                self._compiled_decode_step = mx.compile(
+                    self._decode_step, shapeless=True
+                )
+            except Exception:
+                self._compile_step_failed = True
+        return self._compiled_decode_step
+
+    def __call__(self, tokens, xa, kv_cache=None, return_cross_qk=False):
+        """
+        tokens : mx.array, shape = (batch_size, <= n_ctx)
+            the text tokens
+        xa : mx.array, shape = (batch_size, n_audio_ctx, n_audio_state)
+            the encoded audio features to be attended on
+        return_cross_qk : bool
+            If False (default), skip cross_qk collection for faster decode.
+            Only needed for word-level timestamp alignment (DTW).
+        """
+        if (
+            kv_cache is not None
+            and kv_cache[0] is not None
+            and tokens.shape[-1] == 1
+            and not return_cross_qk
+        ):
+            decode_step = self._get_compiled_decode_step()
+            if decode_step is not None:
+                try:
+                    logits, kv_cache = decode_step(tokens, xa, kv_cache)
+                    return logits, kv_cache, None
+                except Exception:
+                    self._compiled_decode_step = None
+                    self._compile_step_failed = True
+
+            logits, kv_cache = self._decode_step(tokens, xa, kv_cache)
+            return logits, kv_cache, None
+
+        offset = kv_cache[0][0][0].shape[1] if kv_cache else 0
+        x = (
+            self.token_embedding(tokens)
+            + self.positional_embedding[offset : offset + tokens.shape[-1]]
+        )
+        x, kv_cache, cross_qk = self._decode_blocks(
+            x, xa, kv_cache=kv_cache, mask=self._mask, return_cross_qk=return_cross_qk
+        )
         x = self.ln(x)
         return x @ self.token_embedding.weight.T, kv_cache, cross_qk
 

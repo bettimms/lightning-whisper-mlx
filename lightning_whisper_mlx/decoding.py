@@ -268,10 +268,12 @@ class GreedyDecoder(TokenDecoder):
         self.eot = eot
         self._step_probs = []
         self._batch_indices = None
+        self.last_step_probs = None
 
     def reset(self):
         self._step_probs = []
         self._batch_indices = None
+        self.last_step_probs = None
 
     def update(
         self, tokens: mx.array, logits: mx.array, sum_logprobs: mx.array
@@ -290,7 +292,7 @@ class GreedyDecoder(TokenDecoder):
             self._batch_indices = mx.arange(n)
 
         current_logprobs = logprobs[self._batch_indices, next_tokens]
-        self._step_probs.append(mx.exp(current_logprobs))
+        self.last_step_probs = mx.exp(current_logprobs)
         sum_logprobs += current_logprobs * (tokens[:, -1] != self.eot)
 
         eot_mask = tokens[:, -1] == self.eot
@@ -832,10 +834,16 @@ class DecodingTask:
         n_batch = tokens.shape[0]
         sum_logprobs: mx.array = mx.zeros(n_batch)
         no_speech_probs_mx = None  # deferred — avoid GPU sync on step 0
+        active_indices = np.arange(n_batch, dtype=np.int32)
+        finalized_tokens = [None] * n_batch
+        finalized_sum_logprobs = np.zeros(n_batch, dtype=np.float32)
+        token_prob_lists = [[] for _ in range(n_batch)]
 
         # Local references to avoid attribute lookups in the hot loop
         inference_logits = self.inference.logits
+        inference_rearrange = self.inference.rearrange_kv_cache
         decoder_update = self.decoder.update
+        decoder_last_step_probs = lambda: getattr(self.decoder, "last_step_probs", None)
         suppress_mask = self._fused_suppress_mask
         blank_mask = self._blank_mask
         ts_filter = self._timestamp_filter
@@ -897,24 +905,88 @@ class DecodingTask:
                     tokens, logits, sum_logprobs
                 )
 
-                # One GPU→CPU sync per step: fetch last token column.
-                # Before: 3 syncs/step (full token matrix + force_ts + completed).
-                # After:  1 sync/step (n_batch ints for CPU mirror + EOT check).
-                if is_single:
-                    last_tok = tokens[0, -1].item()
-                    if cpu_sampled is not None:
-                        cpu_sampled.append(last_tok)
-                    if last_tok == eot_id or tokens.shape[-1] > n_ctx:
-                        break
+                # Fetch the sampled token id and probability in one sync.
+                last_step_probs = decoder_last_step_probs()
+                if last_step_probs is not None:
+                    step_meta = np.array(
+                        mx.stack(
+                            [
+                                tokens[:, -1].astype(mx.float32),
+                                last_step_probs.astype(mx.float32),
+                            ],
+                            axis=1,
+                        )
+                    )
+                    last_col = step_meta[:, 0].astype(np.int32, copy=False)
+                    step_probs_np = step_meta[:, 1]
                 else:
                     last_col = np.array(tokens[:, -1])
-                    if cpu_sampled_buf is not None:
-                        cpu_sampled_buf[:, n_sampled] = last_col
-                        n_sampled += 1
-                    if np.all(last_col == eot_id) or tokens.shape[-1] > n_ctx:
+                    step_probs_np = None
+
+                if step_probs_np is not None:
+                    for local_idx, global_idx in enumerate(active_indices):
+                        token_prob_lists[global_idx].append(float(step_probs_np[local_idx]))
+
+                if cpu_sampled is not None:
+                    cpu_sampled.append(int(last_col[0]))
+                elif cpu_sampled_buf is not None:
+                    cpu_sampled_buf[:, n_sampled] = last_col
+                    n_sampled += 1
+
+                if tokens.shape[-1] > n_ctx:
+                    remaining_tokens = np.array(tokens)
+                    remaining_sum_logprobs = np.array(sum_logprobs)
+                    for row, global_idx in enumerate(active_indices):
+                        finalized_tokens[global_idx] = remaining_tokens[row]
+                        finalized_sum_logprobs[global_idx] = remaining_sum_logprobs[row]
+                    active_indices = np.empty(0, dtype=np.int32)
+                    break
+
+                if is_single:
+                    if last_col[0] == eot_id:
+                        finalized_tokens[active_indices[0]] = np.array(tokens[0])
+                        finalized_sum_logprobs[active_indices[0]] = float(
+                            np.array(sum_logprobs[0])
+                        )
+                        active_indices = np.empty(0, dtype=np.int32)
                         break
+                    continue
+
+                completed_mask = last_col == eot_id
+                if not completed_mask.any():
+                    continue
+
+                finished_positions = np.flatnonzero(completed_mask)
+                finished_idx = mx.array(finished_positions, dtype=mx.int32)
+                finished_tokens = np.array(tokens[finished_idx])
+                finished_sum_logprobs = np.array(sum_logprobs[finished_idx])
+                for row, local_idx in enumerate(finished_positions):
+                    global_idx = active_indices[local_idx]
+                    finalized_tokens[global_idx] = finished_tokens[row]
+                    finalized_sum_logprobs[global_idx] = finished_sum_logprobs[row]
+
+                if finished_positions.size == active_indices.size:
+                    active_indices = np.empty(0, dtype=np.int32)
+                    break
+
+                keep_positions = np.flatnonzero(~completed_mask)
+                keep_idx = mx.array(keep_positions, dtype=mx.int32)
+                tokens = tokens[keep_idx]
+                audio_features = audio_features[keep_idx]
+                sum_logprobs = sum_logprobs[keep_idx]
+                active_indices = active_indices[keep_positions]
+                inference_rearrange(keep_positions.tolist())
+                if cpu_sampled_buf is not None:
+                    cpu_sampled_buf = cpu_sampled_buf[keep_positions]
         finally:
             self.inference.reset()
+
+        if active_indices.size:
+            remaining_tokens = np.array(tokens)
+            remaining_sum_logprobs = np.array(sum_logprobs)
+            for row, global_idx in enumerate(active_indices):
+                finalized_tokens[global_idx] = remaining_tokens[row]
+                finalized_sum_logprobs[global_idx] = remaining_sum_logprobs[row]
 
         # Deferred no_speech_probs sync (was previously on step 0)
         if no_speech_probs_mx is not None:
@@ -922,7 +994,20 @@ class DecodingTask:
         else:
             no_speech_probs = [np.nan] * n_batch
 
-        return tokens, sum_logprobs, no_speech_probs
+        if any(seq is None for seq in finalized_tokens):
+            raise RuntimeError("decode loop finalized an incomplete token set")
+
+        max_len = max(len(seq) for seq in finalized_tokens)
+        tokens_np = np.full((n_batch, max_len), eot_id, dtype=np.int32)
+        for i, seq in enumerate(finalized_tokens):
+            tokens_np[i, : len(seq)] = seq
+
+        return (
+            mx.array(tokens_np),
+            mx.array(finalized_sum_logprobs),
+            no_speech_probs,
+            token_prob_lists,
+        )
 
     def run(self, mel: mx.array) -> List[DecodingResult]:
         self.decoder.reset()
@@ -957,7 +1042,9 @@ class DecodingTask:
             )
 
         # call the main sampling loop
-        tokens, sum_logprobs, no_speech_probs = self._main_loop(audio_features, tokens)
+        tokens, sum_logprobs, no_speech_probs, token_prob_lists = self._main_loop(
+            audio_features, tokens
+        )
 
         # reshape the tensors to have (n_audio, n_group) as the first two dimensions
         audio_features = audio_features[:: self.n_group]
@@ -993,23 +1080,16 @@ class DecodingTask:
         if len(set(map(len, fields))) != 1:
             raise RuntimeError(f"inconsistent result lengths: {list(map(len, fields))}")
 
-        # Extract per-token probabilities captured by GreedyDecoder
-        step_probs = getattr(self.decoder, '_step_probs', [])
-        if step_probs:
-            stacked = mx.stack(step_probs, axis=0)  # (n_steps, n_batch)
-            stacked_np = np.array(stacked)
-        else:
-            stacked_np = None
-
         results = []
         for k, (text, language, toks, features, avg_logprob, no_speech_prob) in enumerate(
             zip(*fields)
         ):
-            if stacked_np is not None:
-                n_tok = len(toks)
-                probs = stacked_np[:n_tok, k] if n_tok > 0 and k < stacked_np.shape[1] else None
-            else:
-                probs = None
+            probs = None
+            candidate_idx = k * self.n_group + selected[k]
+            if candidate_idx < len(token_prob_lists):
+                tok_probs = token_prob_lists[candidate_idx][: len(toks)]
+                if tok_probs:
+                    probs = np.array(tok_probs, dtype=np.float32)
             results.append(
                 DecodingResult(
                     audio_features=features,
