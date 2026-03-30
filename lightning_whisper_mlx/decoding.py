@@ -126,8 +126,16 @@ class DecodingResult:
     avg_logprob: float = np.nan
     no_speech_prob: float = np.nan
     temperature: float = np.nan
-    compression_ratio: float = np.nan
+    _compression_ratio: float = np.nan
     token_probs: Optional[np.ndarray] = None
+
+    @property
+    def compression_ratio(self) -> float:
+        """Lazy computation — zlib.compress only runs when actually accessed."""
+        if np.isnan(self._compression_ratio) and self.text:
+            ratio = compression_ratio(self.text)
+            object.__setattr__(self, '_compression_ratio', ratio)
+        return self._compression_ratio
 
 
 class Inference:
@@ -142,6 +150,7 @@ class Inference:
             # only need to use the last token except in the first forward pass
             tokens = tokens[:, -1:]
 
+        # return_cross_qk=False (default) skips cross-attention QK collection
         logits, self.kv_cache, _ = self.model.decoder(
             tokens, audio_features, kv_cache=self.kv_cache
         )
@@ -339,27 +348,93 @@ class ApplyTimestampRules(LogitFilter):
         self.tokenizer = tokenizer
         self.sample_begin = sample_begin
         self.max_initial_timestamp_index = max_initial_timestamp_index
+        # Cache frequently accessed values
+        self._ts_begin = tokenizer.timestamp_begin
+        self._eot = tokenizer.eot
+        self._no_timestamps = tokenizer.no_timestamps
+        # Pre-allocate mask buffer (resized on first call)
+        self._mask_buf = None
+
+    def _get_mask_buf(self, n_batch: int, n_vocab: int) -> np.ndarray:
+        """Reuse a pre-allocated buffer instead of np.zeros() every step."""
+        if self._mask_buf is None or self._mask_buf.shape != (n_batch, n_vocab):
+            self._mask_buf = np.zeros((n_batch, n_vocab), np.float32)
+        else:
+            self._mask_buf[:] = 0.0
+        return self._mask_buf
 
     def apply(self, logits: mx.array, tokens: mx.array) -> mx.array:
-        """Vectorized timestamp rule application.
-
-        Replaces per-batch-item Python loops with batched numpy/mlx operations,
-        eliminating repeated GPU->CPU syncs during autoregressive decoding.
-        """
         n_batch = tokens.shape[0]
+
+        # Fast path for single-item batches (most common case).
+        # Avoids numpy batch operations and 2D mask allocation.
+        if n_batch == 1:
+            return self._apply_single(logits, tokens)
+
+        return self._apply_batch(logits, tokens, n_batch)
+
+    def _apply_single(self, logits: mx.array, tokens: mx.array) -> mx.array:
+        """Optimized path for batch_size=1: no batch numpy, minimal allocation."""
+        ts_begin = self._ts_begin
+        eot = self._eot
         n_vocab = logits.shape[-1]
-        ts_begin = self.tokenizer.timestamp_begin
-        eot = self.tokenizer.eot
 
-        mask = np.zeros((n_batch, n_vocab), np.float32)
+        mask = self._get_mask_buf(1, n_vocab)
 
-        # Suppress <|notimestamps|>
-        if self.tokenizer.no_timestamps is not None:
-            mask[:, self.tokenizer.no_timestamps] = -np.inf
+        if self._no_timestamps is not None:
+            mask[0, self._no_timestamps] = -np.inf
 
-        # Single numpy conversion for the entire batch — one GPU sync instead of N
-        sampled = tokens[:, self.sample_begin:]
-        sampled_np = np.array(sampled)
+        seq = tokens[0, self.sample_begin:]
+        seq_np = np.array(seq)
+        seq_len = seq_np.shape[0]
+
+        if seq_len >= 1:
+            last = int(seq_np[-1])
+            last_is_ts = last >= ts_begin
+            penult_is_ts = True if seq_len < 2 else int(seq_np[-2]) >= ts_begin
+
+            if last_is_ts:
+                if penult_is_ts:
+                    mask[0, ts_begin:] = -np.inf
+                else:
+                    mask[0, :eot] = -np.inf
+
+            # Find last timestamp position for monotonicity
+            ts_positions = np.where(seq_np >= ts_begin)[0]
+            if len(ts_positions) > 0:
+                last_timestamp = int(ts_positions[-1])
+                if not last_timestamp or penult_is_ts:
+                    last_timestamp += 1
+                if last_timestamp > 0:
+                    mask[0, ts_begin:ts_begin + last_timestamp] = -np.inf
+
+        if tokens.shape[1] == self.sample_begin:
+            mask[0, :ts_begin] = -np.inf
+            if self.max_initial_timestamp_index is not None:
+                last_allowed = ts_begin + self.max_initial_timestamp_index
+                mask[0, last_allowed + 1:] = -np.inf
+
+        # Force timestamp if timestamp prob > max text prob
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        ts_logprob = mx.logsumexp(logprobs[0, ts_begin:], axis=-1)
+        max_text_logprob = mx.max(logprobs[0, :ts_begin], axis=-1)
+        if (ts_logprob > max_text_logprob).item():
+            mask[0, :ts_begin] = -np.inf
+
+        return logits + mx.array(mask, logits.dtype)
+
+    def _apply_batch(self, logits: mx.array, tokens: mx.array, n_batch: int) -> mx.array:
+        """Vectorized path for multi-item batches."""
+        n_vocab = logits.shape[-1]
+        ts_begin = self._ts_begin
+        eot = self._eot
+
+        mask = self._get_mask_buf(n_batch, n_vocab)
+
+        if self._no_timestamps is not None:
+            mask[:, self._no_timestamps] = -np.inf
+
+        sampled_np = np.array(tokens[:, self.sample_begin:])
         seq_len = sampled_np.shape[1]
 
         if seq_len >= 1:
@@ -370,17 +445,14 @@ class ApplyTimestampRules(LogitFilter):
             if seq_len >= 2:
                 penult_is_ts = sampled_np[:, -2] >= ts_begin
 
-            # Where last was timestamp AND penultimate was timestamp -> suppress all timestamps
             both_ts = last_is_ts & penult_is_ts
             for k in np.where(both_ts)[0]:
                 mask[k, ts_begin:] = -np.inf
 
-            # Where last was timestamp AND penultimate was NOT timestamp -> suppress text tokens
             ts_after_text = last_is_ts & ~penult_is_ts
             for k in np.where(ts_after_text)[0]:
                 mask[k, :eot] = -np.inf
 
-            # Monotonicity constraint on timestamps
             ts_mask = sampled_np >= ts_begin
             ts_indices = np.where(ts_mask, np.arange(seq_len)[None, :], -1)
             has_any_ts = ts_mask.any(axis=1)
@@ -395,14 +467,12 @@ class ApplyTimestampRules(LogitFilter):
                     if last_timestamp > 0:
                         mask[k, ts_begin:ts_begin + last_timestamp] = -np.inf
 
-        # First-step rules
         if tokens.shape[1] == self.sample_begin:
             mask[:, :ts_begin] = -np.inf
             if self.max_initial_timestamp_index is not None:
                 last_allowed = ts_begin + self.max_initial_timestamp_index
                 mask[:, last_allowed + 1:] = -np.inf
 
-        # Vectorized: if timestamp probability > max text probability, force timestamp
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         ts_logprobs = mx.logsumexp(logprobs[:, ts_begin:], axis=-1)
         max_text_logprobs = mx.max(logprobs[:, :ts_begin], axis=-1)
@@ -419,7 +489,6 @@ class DecodingTask:
     inference: Inference
     sequence_ranker: SequenceRanker
     decoder: TokenDecoder
-    logit_filters: List[LogitFilter]
 
     def __init__(self, model: "Whisper", options: DecodingOptions):
         self.model = model
@@ -461,16 +530,26 @@ class DecodingTask:
         else:
             self.decoder = GreedyDecoder(options.temperature, tokenizer.eot)
 
-        # logit filters: applies various rules to suppress or penalize certain tokens
-        self.logit_filters = []
-        if self.options.suppress_blank:
-            self.logit_filters.append(
-                SuppressBlank(self.tokenizer, self.sample_begin, model.dims.n_vocab)
-            )
+        # Pre-compute a single fused suppression mask (SuppressBlank + SuppressTokens).
+        # These are constant across all decode steps, so one mx.array addition per step
+        # instead of two separate filter calls with their own mx.array additions.
+        n_vocab = model.dims.n_vocab
+        fused_suppress = np.zeros(n_vocab, np.float32)
         if self.options.suppress_tokens:
-            self.logit_filters.append(
-                SuppressTokens(self._get_suppress_tokens(), model.dims.n_vocab)
-            )
+            for t in self._get_suppress_tokens():
+                fused_suppress[t] = -np.inf
+        self._fused_suppress_mask = mx.array(fused_suppress)
+
+        # SuppressBlank only fires on the very first sample step
+        if self.options.suppress_blank:
+            blank_mask = np.zeros(n_vocab, np.float32)
+            blank_mask[self.tokenizer.encode(" ") + [self.tokenizer.eot]] = -np.inf
+            self._blank_mask = mx.array(blank_mask)
+        else:
+            self._blank_mask = None
+
+        # Timestamp filter is the only stateful per-step filter
+        self._timestamp_filter = None
         if not options.without_timestamps:
             precision = CHUNK_LENGTH / model.dims.n_audio_ctx  # usually 0.02 seconds
             max_initial_timestamp_index = None
@@ -478,10 +557,8 @@ class DecodingTask:
                 max_initial_timestamp_index = round(
                     self.options.max_initial_timestamp / precision
                 )
-            self.logit_filters.append(
-                ApplyTimestampRules(
-                    tokenizer, self.sample_begin, max_initial_timestamp_index
-                )
+            self._timestamp_filter = ApplyTimestampRules(
+                tokenizer, self.sample_begin, max_initial_timestamp_index
             )
 
     def _verify_options(self, options: DecodingOptions) -> DecodingOptions:
@@ -596,31 +673,46 @@ class DecodingTask:
         sum_logprobs: mx.array = mx.zeros(n_batch)
         no_speech_probs = [np.nan] * n_batch
 
+        # Local references to avoid attribute lookups in the hot loop
+        inference_logits = self.inference.logits
+        decoder_update = self.decoder.update
+        suppress_mask = self._fused_suppress_mask
+        blank_mask = self._blank_mask
+        ts_filter = self._timestamp_filter
+        sample_begin = self.sample_begin
+        sample_len = self.sample_len
+        n_ctx = self.n_ctx
+        sot_index = self.sot_index
+        no_speech_token = self.tokenizer.no_speech
+
         try:
-            for i in range(self.sample_len):
-                logits = self.inference.logits(tokens, audio_features)
+            for i in range(sample_len):
+                logits = inference_logits(tokens, audio_features)
 
-                if (
-                    i == 0 and self.tokenizer.no_speech is not None
-                ):  # save no_speech_probs
+                if i == 0 and no_speech_token is not None:
                     probs_at_sot = mx.softmax(
-                        logits[:, self.sot_index].astype(mx.float32), axis=-1
+                        logits[:, sot_index].astype(mx.float32), axis=-1
                     )
-                    no_speech_probs = probs_at_sot[:, self.tokenizer.no_speech].tolist()
+                    no_speech_probs = probs_at_sot[:, no_speech_token].tolist()
 
-                # now we need to consider the logits at the last token only
                 logits = logits[:, -1]
 
-                # apply the logit filters, e.g. for suppressing or applying penalty to
-                for logit_filter in self.logit_filters:
-                    logits = logit_filter.apply(logits, tokens)
+                # Apply fused constant suppression mask (single addition)
+                logits = logits + suppress_mask
 
-                # expand the tokens tensor with the selected next tokens
-                tokens, completed, sum_logprobs = self.decoder.update(
+                # SuppressBlank only on the first sample step
+                if i == 0 and blank_mask is not None:
+                    logits = logits + blank_mask
+
+                # Timestamp rules (the only stateful per-step filter)
+                if ts_filter is not None:
+                    logits = ts_filter.apply(logits, tokens)
+
+                tokens, completed, sum_logprobs = decoder_update(
                     tokens, logits, sum_logprobs
                 )
 
-                if completed or tokens.shape[-1] > self.n_ctx:
+                if completed or tokens.shape[-1] > n_ctx:
                     break
         finally:
             self.inference.reset()
@@ -631,9 +723,6 @@ class DecodingTask:
         self.decoder.reset()
         tokenizer: Tokenizer = self.tokenizer
         n_audio: int = mel.shape[0]
-
-        mel = mx.repeat(mel, repeats=1, axis=0)
-        n_audio *= 1
 
         audio_features: mx.array = self._get_audio_features(mel)  # encoder forward pass
         tokens: np.array = np.array(self.initial_tokens)
@@ -725,7 +814,6 @@ class DecodingTask:
                     avg_logprob=avg_logprob,
                     no_speech_prob=no_speech_prob,
                     temperature=self.options.temperature,
-                    compression_ratio=compression_ratio(text),
                     token_probs=probs,
                 )
             )

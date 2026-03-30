@@ -135,11 +135,12 @@ class AudioEncoder(nn.Module):
 
         self.blocks = [ResidualAttentionBlock(n_state, n_head) for _ in range(n_layer)]
         self.ln_post = nn.LayerNorm(n_state)
+        self._compiled = False
 
-    def __call__(self, x):
+    def _encode(self, x):
+        """Core encode path — separated for mx.compile."""
         x = nn.gelu(self.conv1(x))
         x = nn.gelu(self.conv2(x))
-        assert x.shape[1:] == self._positional_embedding.shape, "incorrect audio shape"
         x = x + self._positional_embedding
 
         for block in self.blocks:
@@ -147,6 +148,15 @@ class AudioEncoder(nn.Module):
 
         x = self.ln_post(x)
         return x
+
+    def __call__(self, x):
+        # Compile on first use so Metal shader graph is fused.
+        # mx.compile traces the function and builds a single fused Metal kernel
+        # that eliminates per-layer Python dispatch overhead.
+        if not self._compiled:
+            self._encode = mx.compile(self._encode)
+            self._compiled = True
+        return self._encode(x)
 
 
 class TextDecoder(nn.Module):
@@ -163,6 +173,7 @@ class TextDecoder(nn.Module):
 
         self.token_embedding = nn.Embedding(n_vocab, n_state)
         self.positional_embedding = mx.zeros((n_ctx, n_state))
+        self._n_blocks = n_layer
 
         self.blocks = [
             ResidualAttentionBlock(n_state, n_head, cross_attention=True)
@@ -173,12 +184,15 @@ class TextDecoder(nn.Module):
             dtype
         )
 
-    def __call__(self, x, xa, kv_cache=None):
+    def __call__(self, x, xa, kv_cache=None, return_cross_qk=False):
         """
         x : mx.array, shape = (batch_size, <= n_ctx)
             the text tokens
         xa : mx.array, shape = (batch_size, n_audio_ctx, n_audio_state)
             the encoded audio features to be attended on
+        return_cross_qk : bool
+            If False (default), skip cross_qk collection for faster decode.
+            Only needed for word-level timestamp alignment (DTW).
         """
         offset = kv_cache[0][0][0].shape[1] if kv_cache else 0
         x = (
@@ -186,13 +200,23 @@ class TextDecoder(nn.Module):
             + self.positional_embedding[offset : offset + x.shape[-1]]
         )
 
+        n = self._n_blocks
         if kv_cache is None:
-            kv_cache = [None] * len(self.blocks)
-        cross_qk = [None] * len(self.blocks)
-        for e, block in enumerate(self.blocks):
-            x, kv_cache[e], cross_qk[e] = block(
-                x, xa, mask=self._mask, kv_cache=kv_cache[e]
-            )
+            kv_cache = [None] * n
+        mask = self._mask
+
+        if return_cross_qk:
+            cross_qk = [None] * n
+            for e in range(n):
+                x, kv_cache[e], cross_qk[e] = self.blocks[e](
+                    x, xa, mask=mask, kv_cache=kv_cache[e]
+                )
+        else:
+            for e in range(n):
+                x, kv_cache[e], _ = self.blocks[e](
+                    x, xa, mask=mask, kv_cache=kv_cache[e]
+                )
+            cross_qk = None
 
         x = self.ln(x)
         return x @ self.token_embedding.weight.T, kv_cache, cross_qk
@@ -248,7 +272,7 @@ class Whisper(nn.Module):
         return self.decoder(tokens, audio_features)[0]
 
     def forward_with_cross_qk(self, mel, tokens):
-        logits, _, cross_qk = self.decoder(tokens, self.encoder(mel))
+        logits, _, cross_qk = self.decoder(tokens, self.encoder(mel), return_cross_qk=True)
         return logits, cross_qk
 
     def __call__(self, mel, tokens):

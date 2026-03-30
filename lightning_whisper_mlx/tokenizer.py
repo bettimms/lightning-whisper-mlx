@@ -289,24 +289,38 @@ class Tokenizer:
         decoded_full = self.decode_with_timestamps(tokens)
         replacement_char = "\ufffd"
 
+        # Pre-decode each individual token once (avoids O(n^2) cumulative decoding)
+        single_decodes = [self.decode_with_timestamps([t]) for t in tokens]
+
         words = []
         word_tokens = []
         current_tokens = []
+        current_text = ""
         unicode_offset = 0
 
-        for token in tokens:
+        for i, token in enumerate(tokens):
             current_tokens.append(token)
-            decoded = self.decode_with_timestamps(current_tokens)
+            # Build cumulative text. For single-byte tokens this matches the
+            # cumulative decode; for multi-byte sequences we fall back.
+            candidate = current_text + single_decodes[i]
+
+            # Verify by checking the actual cumulative decode only when the
+            # candidate might contain a replacement char (multi-byte boundary)
+            if replacement_char in candidate:
+                candidate = self.decode_with_timestamps(current_tokens)
 
             if (
-                replacement_char not in decoded
-                or decoded_full[unicode_offset + decoded.index(replacement_char)]
+                replacement_char not in candidate
+                or decoded_full[unicode_offset + candidate.index(replacement_char)]
                 == replacement_char
             ):
-                words.append(decoded)
+                words.append(candidate)
                 word_tokens.append(current_tokens)
                 current_tokens = []
-                unicode_offset += len(decoded)
+                current_text = ""
+                unicode_offset += len(candidate)
+            else:
+                current_text = candidate
 
         return words, word_tokens
 
