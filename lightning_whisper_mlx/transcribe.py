@@ -76,7 +76,7 @@ def transcribe_audio(
     append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
     clip_timestamps: Union[str, List[float]] = "0",
     hallucination_silence_threshold: Optional[float] = None,
-    batch_size: 6,
+    batch_size: int = 6,
     **decode_options,
 ):
     """

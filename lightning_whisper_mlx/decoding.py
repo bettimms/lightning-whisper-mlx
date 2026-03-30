@@ -118,8 +118,8 @@ class DecodingOptions:
 
 @dataclass(frozen=True)
 class DecodingResult:
-    audio_features: mx.array
-    language: str
+    audio_features: Optional[mx.array] = None
+    language: str = ""
     language_probs: Optional[Dict[str, float]] = None
     tokens: List[int] = field(default_factory=list)
     text: str = ""
@@ -514,9 +514,6 @@ class ApplyTimestampRules(LogitFilter):
         Like apply_cpu() for batch=1, this avoids GPU→CPU transfer for the token
         sequence and computes force-timestamp entirely on GPU.
 
-        Before: 2 GPU syncs/step (np.array(tokens), np.array(force_ts))
-        After:  0 GPU syncs/step (all token data from CPU mirror, force on GPU)
-
         Parameters
         ----------
         logits : mx.array, shape = (n_batch, vocab_size)
@@ -841,7 +838,10 @@ class DecodingTask:
         active_indices = np.arange(n_batch, dtype=np.int32)
         finalized_tokens = [None] * n_batch
         finalized_sum_logprobs = np.zeros(n_batch, dtype=np.float32)
-        token_prob_lists = [[] for _ in range(n_batch)]
+        # Pre-allocated buffer for token probabilities.
+        # Avoids per-step Python for-loop + list.append overhead.
+        token_prob_buf = np.zeros((n_batch, sample_len), dtype=np.float32)
+        token_prob_len = np.zeros(n_batch, dtype=np.int32)
 
         # Local references to avoid attribute lookups in the hot loop
         inference_logits = self.inference.logits
@@ -928,8 +928,9 @@ class DecodingTask:
                     step_probs_np = None
 
                 if step_probs_np is not None:
-                    for local_idx, global_idx in enumerate(active_indices):
-                        token_prob_lists[global_idx].append(float(step_probs_np[local_idx]))
+                    cols = token_prob_len[active_indices]
+                    token_prob_buf[active_indices, cols] = step_probs_np[:len(active_indices)]
+                    token_prob_len[active_indices] = cols + 1
 
                 if cpu_sampled is not None:
                     cpu_sampled.append(int(last_col[0]))
@@ -1006,6 +1007,12 @@ class DecodingTask:
         for i, seq in enumerate(finalized_tokens):
             tokens_np[i, : len(seq)] = seq
 
+        # Convert pre-allocated prob buffer to per-sequence lists for consumers.
+        token_prob_lists = [
+            token_prob_buf[i, :token_prob_len[i]] if token_prob_len[i] > 0 else None
+            for i in range(n_batch)
+        ]
+
         return (
             mx.array(tokens_np),
             mx.array(finalized_sum_logprobs),
@@ -1026,12 +1033,8 @@ class DecodingTask:
         languages, language_probs = self._detect_language(audio_features, tokens)
         if self.options.task == "lang_id":
             return [
-                DecodingResult(
-                    audio_features=features, language=language, language_probs=probs
-                )
-                for features, language, probs in zip(
-                    audio_features, languages, language_probs
-                )
+                DecodingResult(language=language, language_probs=probs)
+                for language, probs in zip(languages, language_probs)
             ]
 
         # repeat tokens by the group size, for beam search or best-of-n sampling
@@ -1051,9 +1054,8 @@ class DecodingTask:
         )
 
         # reshape the tensors to have (n_audio, n_group) as the first two dimensions
-        audio_features = audio_features[:: self.n_group]
         no_speech_probs = no_speech_probs[:: self.n_group]
-        assert audio_features.shape[0] == len(no_speech_probs) == n_audio
+        assert len(no_speech_probs) == n_audio
 
         tokens = tokens.reshape(n_audio, self.n_group, -1)
         sum_logprobs = sum_logprobs.reshape(n_audio, self.n_group)
@@ -1077,7 +1079,6 @@ class DecodingTask:
             texts,
             languages,
             tokens,
-            audio_features,
             avg_logprobs,
             no_speech_probs,
         )
@@ -1085,18 +1086,17 @@ class DecodingTask:
             raise RuntimeError(f"inconsistent result lengths: {list(map(len, fields))}")
 
         results = []
-        for k, (text, language, toks, features, avg_logprob, no_speech_prob) in enumerate(
+        for k, (text, language, toks, avg_logprob, no_speech_prob) in enumerate(
             zip(*fields)
         ):
             probs = None
             candidate_idx = k * self.n_group + selected[k]
             if candidate_idx < len(token_prob_lists):
-                tok_probs = token_prob_lists[candidate_idx][: len(toks)]
-                if tok_probs:
-                    probs = np.array(tok_probs, dtype=np.float32)
+                tok_probs = token_prob_lists[candidate_idx]
+                if tok_probs is not None and len(tok_probs) > 0:
+                    probs = tok_probs[: len(toks)].copy()
             results.append(
                 DecodingResult(
-                    audio_features=features,
                     language=language,
                     tokens=toks,
                     text=text,
