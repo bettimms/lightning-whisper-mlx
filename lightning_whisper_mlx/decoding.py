@@ -838,10 +838,6 @@ class DecodingTask:
         active_indices = np.arange(n_batch, dtype=np.int32)
         finalized_tokens = [None] * n_batch
         finalized_sum_logprobs = np.zeros(n_batch, dtype=np.float32)
-        # Pre-allocated buffer for token probabilities.
-        # Avoids per-step Python for-loop + list.append overhead.
-        token_prob_buf = np.zeros((n_batch, sample_len), dtype=np.float32)
-        token_prob_len = np.zeros(n_batch, dtype=np.int32)
 
         # Local references to avoid attribute lookups in the hot loop
         inference_logits = self.inference.logits
@@ -853,6 +849,11 @@ class DecodingTask:
         ts_filter = self._timestamp_filter
         sample_begin = self.sample_begin
         sample_len = self.sample_len
+
+        # Pre-allocated buffer for token probabilities.
+        # Avoids per-step Python for-loop + list.append overhead.
+        token_prob_buf = np.zeros((n_batch, sample_len), dtype=np.float32)
+        token_prob_len = np.zeros(n_batch, dtype=np.int32)
         n_ctx = self.n_ctx
         sot_index = self.sot_index
         no_speech_token = self.tokenizer.no_speech
