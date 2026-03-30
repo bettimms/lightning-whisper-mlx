@@ -502,8 +502,89 @@ class ApplyTimestampRules(LogitFilter):
 
         return logits + mask_mx
 
+    def apply_cpu_batch(self, logits: mx.array, cpu_sampled_np: np.ndarray) -> mx.array:
+        """Optimized batch path using CPU token matrix.
+
+        Like apply_cpu() for batch=1, this avoids GPU→CPU transfer for the token
+        sequence and computes force-timestamp entirely on GPU.
+
+        Before: 2 GPU syncs/step (np.array(tokens), np.array(force_ts))
+        After:  0 GPU syncs/step (all token data from CPU mirror, force on GPU)
+
+        Parameters
+        ----------
+        logits : mx.array, shape = (n_batch, vocab_size)
+        cpu_sampled_np : np.ndarray, shape = (n_batch, n_sampled) — CPU token mirror
+        """
+        n_batch = cpu_sampled_np.shape[0]
+        n_vocab = logits.shape[-1]
+        ts_begin = self._ts_begin
+        eot = self._eot
+
+        mask = self._get_mask_buf(n_batch, n_vocab)
+
+        if self._no_timestamps is not None:
+            mask[:, self._no_timestamps] = -np.inf
+
+        seq_len = cpu_sampled_np.shape[1]
+
+        if seq_len >= 1:
+            last_tok = cpu_sampled_np[:, -1]
+            last_is_ts = last_tok >= ts_begin
+
+            penult_is_ts = np.ones(n_batch, dtype=bool)
+            if seq_len >= 2:
+                penult_is_ts = cpu_sampled_np[:, -2] >= ts_begin
+
+            both_ts = last_is_ts & penult_is_ts
+            for k in np.where(both_ts)[0]:
+                mask[k, ts_begin:] = -np.inf
+
+            ts_after_text = last_is_ts & ~penult_is_ts
+            for k in np.where(ts_after_text)[0]:
+                mask[k, :eot] = -np.inf
+
+            ts_mask = cpu_sampled_np >= ts_begin
+            ts_indices = np.where(ts_mask, np.arange(seq_len)[None, :], -1)
+            has_any_ts = ts_mask.any(axis=1)
+
+            if has_any_ts.any():
+                last_ts_pos = ts_indices.max(axis=1)
+                for k in np.where(has_any_ts)[0]:
+                    pos = last_ts_pos[k]
+                    last_timestamp = pos
+                    if not last_timestamp or penult_is_ts[k]:
+                        last_timestamp += 1
+                    if last_timestamp > 0:
+                        mask[k, ts_begin:ts_begin + last_timestamp] = -np.inf
+
+        if seq_len == 0:
+            mask[:, :ts_begin] = -np.inf
+            if self.max_initial_timestamp_index is not None:
+                last_allowed = ts_begin + self.max_initial_timestamp_index
+                mask[:, last_allowed + 1:] = -np.inf
+
+        mask_mx = mx.array(mask, logits.dtype)
+
+        # Force-timestamp: GPU-only (no sync). Replaces np.array(ts > text).
+        if seq_len > 0:
+            if self._text_positions is None or self._text_positions.shape[0] != n_vocab:
+                tp = np.zeros(n_vocab, dtype=np.float32)
+                tp[:ts_begin] = 1.0
+                self._text_positions = mx.array(tp, logits.dtype)
+
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            ts_logprobs = mx.logsumexp(logprobs[:, ts_begin:], axis=-1)
+            max_text_logprobs = mx.max(logprobs[:, :ts_begin], axis=-1)
+            should_force = ts_logprobs > max_text_logprobs  # (n_batch,)
+            force_vals = mx.where(should_force, mx.array(-1e9, logits.dtype), mx.array(0.0, logits.dtype))
+            force_contribution = force_vals[:, None] * self._text_positions[None, :]
+            return logits + mask_mx + force_contribution
+
+        return logits + mask_mx
+
     def _apply_batch(self, logits: mx.array, tokens: mx.array, n_batch: int) -> mx.array:
-        """Vectorized path for multi-item batches."""
+        """Fallback batch path when no CPU token mirror is available."""
         n_vocab = logits.shape[-1]
         ts_begin = self._ts_begin
         eot = self._eot
@@ -764,11 +845,23 @@ class DecodingTask:
         sot_index = self.sot_index
         no_speech_token = self.tokenizer.no_speech
         eot_id = self.tokenizer.eot
-
-        # Batch-size-1 fast path: track tokens on CPU, skip lazy `completed` eval
         is_single = n_batch == 1
-        # CPU mirror of sampled tokens — avoids GPU→CPU transfer in timestamp rules
-        cpu_sampled = [] if (is_single and ts_filter is not None) else None
+
+        # CPU token mirror for ALL batch sizes.
+        # Replaces GPU→CPU transfer of the entire (n_batch × seq_len) token matrix
+        # in timestamp rules with a single n_batch-int transfer per step.
+        # Also provides CPU-side completion check (avoids mx.all GPU sync).
+        if ts_filter is not None:
+            if is_single:
+                cpu_sampled = []          # Python list for batch=1
+                cpu_sampled_buf = None
+            else:
+                cpu_sampled = None
+                cpu_sampled_buf = np.empty((n_batch, sample_len), dtype=np.int32)
+        else:
+            cpu_sampled = None
+            cpu_sampled_buf = None
+        n_sampled = 0
 
         try:
             for i in range(sample_len):
@@ -792,8 +885,11 @@ class DecodingTask:
                 # Timestamp rules (the only stateful per-step filter)
                 if ts_filter is not None:
                     if cpu_sampled is not None:
-                        # CPU path: no GPU→CPU transfer, no .item() sync for force-ts
                         logits = ts_filter.apply_cpu(logits, cpu_sampled)
+                    elif cpu_sampled_buf is not None:
+                        logits = ts_filter.apply_cpu_batch(
+                            logits, cpu_sampled_buf[:, :n_sampled]
+                        )
                     else:
                         logits = ts_filter.apply(logits, tokens)
 
@@ -801,15 +897,21 @@ class DecodingTask:
                     tokens, logits, sum_logprobs
                 )
 
+                # One GPU→CPU sync per step: fetch last token column.
+                # Before: 3 syncs/step (full token matrix + force_ts + completed).
+                # After:  1 sync/step (n_batch ints for CPU mirror + EOT check).
                 if is_single:
-                    # Single sync: get last token for CPU tracking + EOT check
                     last_tok = tokens[0, -1].item()
                     if cpu_sampled is not None:
                         cpu_sampled.append(last_tok)
                     if last_tok == eot_id or tokens.shape[-1] > n_ctx:
                         break
                 else:
-                    if completed or tokens.shape[-1] > n_ctx:
+                    last_col = np.array(tokens[:, -1])
+                    if cpu_sampled_buf is not None:
+                        cpu_sampled_buf[:, n_sampled] = last_col
+                        n_sampled += 1
+                    if np.all(last_col == eot_id) or tokens.shape[-1] > n_ctx:
                         break
         finally:
             self.inference.reset()
